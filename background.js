@@ -34,9 +34,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'stopScraping') {
     scrapingInProgress = false;
     currentScrapingStatus = null;
+    updateBadge('', '');
     sendResponse({ success: true });
     return true;
   }
+});
+
+// Clear badge on extension startup
+chrome.runtime.onStartup.addListener(() => {
+  updateBadge('', '');
+});
+
+// Clear badge when extension is installed/updated
+chrome.runtime.onInstalled.addListener(() => {
+  updateBadge('', '');
+});
+
+// Handle notification clicks - clear notification
+chrome.notifications.onClicked.addListener((notificationId) => {
+  chrome.notifications.clear(notificationId);
 });
 
 // Function to update URL with page parameter
@@ -105,6 +121,28 @@ async function scrapePage(tabId, pageNumber) {
   }
 }
 
+// Update extension badge
+function updateBadge(text, color = '#667eea') {
+  chrome.action.setBadgeText({ text: text });
+  chrome.action.setBadgeBackgroundColor({ color: color });
+}
+
+// Show notification
+async function showNotification(title, message, type = 'basic') {
+  try {
+    await chrome.notifications.create({
+      type: type,
+      iconUrl: 'icon48.png',
+      title: title,
+      message: message,
+      priority: 2
+    });
+  } catch (error) {
+    // Notifications might not be available, ignore
+    console.log('Notification not available:', error);
+  }
+}
+
 // Main background scraping function
 async function startBackgroundScraping(numPages, tabId) {
   scrapingInProgress = true;
@@ -114,6 +152,9 @@ async function startBackgroundScraping(numPages, tabId) {
     connectionsFound: 0,
     status: 'Starting...'
   };
+  
+  // Update badge to show scraping started
+  updateBadge('...', '#ff9800');
   
   try {
     // Get tab info
@@ -145,6 +186,11 @@ async function startBackgroundScraping(numPages, tabId) {
       // Update status
       currentScrapingStatus.currentPage = page;
       currentScrapingStatus.status = `Scraping page ${page} of ${numPages}...`;
+      
+      // Update badge with progress
+      const progressPercent = Math.round((page / numPages) * 100);
+      updateBadge(`${page}/${numPages}`, '#ff9800');
+      
       broadcastStatus();
       
       // Update URL with page number
@@ -190,8 +236,20 @@ async function startBackgroundScraping(numPages, tabId) {
       await chrome.storage.local.set({ linkedinData: allData });
       currentScrapingStatus.status = `Completed! Scraped ${allData.length} connections from ${currentScrapingStatus.currentPage} page(s)`;
       currentScrapingStatus.connectionsFound = allData.length;
+      
+      // Update badge to show completion
+      updateBadge('✓', '#4caf50');
+      
+      // Show notification
+      await showNotification(
+        'Scraping Complete!',
+        `Successfully scraped ${allData.length} connections. Click the extension to download CSV.`,
+        'basic'
+      );
     } else {
       currentScrapingStatus.status = 'No connections found';
+      updateBadge('!', '#f44336');
+      await showNotification('Scraping Complete', 'No connections found on the pages.', 'basic');
     }
     
     broadcastStatus();
@@ -208,8 +266,17 @@ async function startBackgroundScraping(numPages, tabId) {
   } catch (error) {
     scrapingInProgress = false;
     currentScrapingStatus.status = `Error: ${error.message}`;
+    updateBadge('✗', '#f44336');
+    await showNotification('Scraping Failed', error.message, 'basic');
     broadcastStatus();
     throw error;
+  } finally {
+    // Clear badge after 5 seconds if not already updated
+    setTimeout(() => {
+      if (!scrapingInProgress) {
+        chrome.action.setBadgeText({ text: '' });
+      }
+    }, 5000);
   }
 }
 

@@ -2,6 +2,9 @@
 
 let scrapedData = [];
 
+// Check scraping status periodically
+let statusCheckInterval = null;
+
 // Check if we're on a LinkedIn search page
 document.addEventListener('DOMContentLoaded', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -13,6 +16,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   
   // Check for existing data
+  await loadStoredData();
+  
+  // Check if scraping is in progress
+  checkScrapingStatus();
+  
+  // Set up periodic status check
+  statusCheckInterval = setInterval(checkScrapingStatus, 1000);
+});
+
+// Clean up interval when popup closes
+window.addEventListener('beforeunload', () => {
+  if (statusCheckInterval) {
+    clearInterval(statusCheckInterval);
+  }
+});
+
+// Load stored data
+async function loadStoredData() {
   const stored = await chrome.storage.local.get(['linkedinData']);
   if (stored.linkedinData && stored.linkedinData.length > 0) {
     scrapedData = stored.linkedinData;
@@ -20,193 +41,109 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('downloadBtn').style.display = 'block';
     showStatus(`${scrapedData.length} connections found. Click Download CSV to export.`, 'success');
   }
-});
+}
 
-// Function to update URL with page parameter
-function updateUrlPage(url, page) {
+// Check scraping status from background
+async function checkScrapingStatus() {
   try {
-    const urlObj = new URL(url);
-    urlObj.searchParams.set('page', page.toString());
-    return urlObj.toString();
+    const response = await chrome.runtime.sendMessage({ action: 'getScrapingStatus' });
+    if (response && response.inProgress) {
+      const status = response.status;
+      if (status) {
+        updateProgress(status);
+        document.getElementById('scrapeBtn').disabled = true;
+        document.getElementById('scrapeBtn').textContent = '🔄 Scraping...';
+      }
+    } else {
+      // Scraping not in progress, check for new data
+      await loadStoredData();
+      document.getElementById('scrapeBtn').disabled = false;
+      document.getElementById('scrapeBtn').textContent = '📥 Scrape Connections';
+    }
   } catch (error) {
-    console.error('Error updating URL:', error);
-    return url;
+    // Background might not be ready, ignore
   }
 }
 
-// Function to wait for page to load
-function waitForPageLoad(tabId, timeout = 10000) {
-  return new Promise((resolve, reject) => {
-    const startTime = Date.now();
-    
-    const checkLoad = async () => {
-      try {
-        const response = await chrome.tabs.sendMessage(tabId, { action: 'checkPageReady' });
-        if (response && response.ready) {
-          resolve(true);
-        } else if (Date.now() - startTime > timeout) {
-          reject(new Error('Page load timeout'));
-        } else {
-          setTimeout(checkLoad, 500);
-        }
-      } catch (error) {
-        // Message might fail if page is still loading
-        if (Date.now() - startTime > timeout) {
-          reject(new Error('Page load timeout'));
-        } else {
-          setTimeout(checkLoad, 500);
-        }
-      }
-    };
-    
-    // Wait a bit before first check
-    setTimeout(checkLoad, 1000);
-  });
-}
-
-// Function to scrape a single page
-async function scrapePage(tabId, pageNumber) {
-  // Update progress
+// Update progress display
+function updateProgress(status) {
   const progressDiv = document.getElementById('progressDiv');
   const progressText = document.getElementById('progressText');
   const progressFill = document.getElementById('progressFill');
-  const pageInput = document.getElementById('pageInput');
-  const totalPages = parseInt(pageInput.value) || 1;
   
-  progressDiv.style.display = 'block';
-  progressText.textContent = `Scraping page ${pageNumber} of ${totalPages}...`;
-  progressFill.style.width = `${(pageNumber / totalPages) * 100}%`;
-  
-  try {
-    // Wait for page to be ready
-    await waitForPageLoad(tabId, 15000);
+  if (status && status.totalPages > 0) {
+    progressDiv.style.display = 'block';
+    progressText.textContent = status.status || `Scraping page ${status.currentPage} of ${status.totalPages}...`;
+    const percent = status.totalPages > 0 ? (status.currentPage / status.totalPages) * 100 : 0;
+    progressFill.style.width = `${percent}%`;
     
-    // Give it a bit more time for content to render
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-    // Scrape the page
-    const response = await chrome.tabs.sendMessage(tabId, { action: 'scrape' });
-    
-    if (response && response.success) {
-      return response.data || [];
-    } else {
-      console.error('Scraping failed for page', pageNumber, response);
-      return [];
+    if (status.connectionsFound > 0) {
+      showCount(status.connectionsFound);
     }
-  } catch (error) {
-    console.error('Error scraping page', pageNumber, error);
-    return [];
   }
 }
 
-// Scrape button handler
+// Scrape button handler - now uses background script
 document.getElementById('scrapeBtn').addEventListener('click', async () => {
   const btn = document.getElementById('scrapeBtn');
   const pageInput = document.getElementById('pageInput');
   const progressDiv = document.getElementById('progressDiv');
   
-  btn.disabled = true;
-  btn.textContent = '🔄 Scraping...';
-  
   const numPages = parseInt(pageInput.value) || 1;
   
   if (numPages < 1 || numPages > 100) {
     showStatus('Please enter a valid page number (1-100)', 'error');
-    btn.disabled = false;
-    btn.textContent = '📥 Scrape Connections';
     return;
   }
-  
-  showStatus(`Starting to scrape ${numPages} page(s)...`, 'info');
-  progressDiv.style.display = 'block';
   
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     
     if (!tab.url.includes('linkedin.com/search/results/people')) {
       showStatus('Please navigate to LinkedIn search results page first!', 'error');
-      btn.disabled = false;
-      btn.textContent = '📥 Scrape Connections';
-      progressDiv.style.display = 'none';
       return;
     }
     
-    // Get base URL
-    let baseUrl = tab.url;
+    btn.disabled = true;
+    btn.textContent = '🔄 Starting...';
+    showStatus(`Starting to scrape ${numPages} page(s)...`, 'info');
+    progressDiv.style.display = 'block';
     
-    // Remove existing page parameter if present
-    try {
-      const urlObj = new URL(baseUrl);
-      urlObj.searchParams.delete('page');
-      baseUrl = urlObj.toString();
-    } catch (e) {
-      // If URL parsing fails, use as is
-    }
+    // Start scraping in background
+    const response = await chrome.runtime.sendMessage({
+      action: 'startScraping',
+      numPages: numPages,
+      tabId: tab.id
+    });
     
-    scrapedData = [];
-    
-    // Scrape each page
-    for (let page = 1; page <= numPages; page++) {
-      // Update URL with page number
-      const pageUrl = updateUrlPage(baseUrl, page);
+    if (response && response.success) {
+      // Scraping started in background, popup can be closed
+      showStatus(`Scraping started! You can close this popup. Check the extension badge for progress.`, 'info');
       
-      // Navigate to the page
-      await chrome.tabs.update(tab.id, { url: pageUrl });
+      // Update UI to show it's running
+      btn.textContent = '🔄 Scraping in Background...';
       
-      // Wait for navigation to complete
-      await new Promise(resolve => {
-        const listener = (tabId, changeInfo) => {
-          if (tabId === tab.id && changeInfo.status === 'complete') {
-            chrome.tabs.onUpdated.removeListener(listener);
-            resolve();
-          }
-        };
-        chrome.tabs.onUpdated.addListener(listener);
-      });
-      
-      // Scrape this page
-      const pageData = await scrapePage(tab.id, page);
-      
-      if (pageData.length > 0) {
-        scrapedData = scrapedData.concat(pageData);
-        showStatus(`Page ${page}/${numPages}: Found ${pageData.length} connections`, 'info');
-      } else {
-        showStatus(`Page ${page}/${numPages}: No connections found (page may not exist)`, 'info');
-        // If no data found, likely reached the end of results
-        break;
-      }
-      
-      // Add delay between pages to avoid rate limiting
-      if (page < numPages) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
-    }
-    
-    // Hide progress
-    progressDiv.style.display = 'none';
-    
-    if (scrapedData.length > 0) {
-      // Store in chrome storage
-      await chrome.storage.local.set({ linkedinData: scrapedData });
-      
-      showCount(scrapedData.length);
-      showStatus(`Successfully scraped ${scrapedData.length} connections from ${numPages} page(s)!`, 'success');
-      document.getElementById('downloadBtn').style.display = 'block';
+      // The status will be updated by the periodic check
     } else {
-      showStatus('No connections found. Please check if the page has results.', 'error');
+      showStatus(`Error: ${response?.error || 'Failed to start scraping'}`, 'error');
+      btn.disabled = false;
+      btn.textContent = '📥 Scrape Connections';
+      progressDiv.style.display = 'none';
     }
   } catch (error) {
     console.error('Error:', error);
     showStatus(`Error: ${error.message}. Please try again.`, 'error');
-    progressDiv.style.display = 'none';
-  } finally {
     btn.disabled = false;
     btn.textContent = '📥 Scrape Connections';
+    progressDiv.style.display = 'none';
   }
 });
 
-// Download CSV button handler
-document.getElementById('downloadBtn').addEventListener('click', () => {
+// Download CSV button handler - loads data from storage if needed
+document.getElementById('downloadBtn').addEventListener('click', async () => {
+  // Reload data from storage in case popup was closed and reopened
+  await loadStoredData();
+  
   if (scrapedData.length === 0) {
     showStatus('No data to download! Please scrape first.', 'error');
     return;
